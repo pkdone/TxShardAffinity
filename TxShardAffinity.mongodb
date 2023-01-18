@@ -1,0 +1,110 @@
+// Toggle this value before each run
+const promoteTxShardAffinity = true;
+
+// Constants
+const shardNames = ["shard0", "shard1"];
+const dbName = "shtestdb";
+const collName = "objs";
+const namespace = `${dbName}.${collName}`;
+const TRAIT_TYPES = ["BLACK", "BLUE", "GREEN", "ORANGE", "PINK", "PURPLE", "RED", "WHITE", "YELLOW"];
+const MAX_LEVEL_ITERATIONS = 10;
+
+// Get handles on DB, collection and Tx session
+db = db.getSiblingDB(dbName);
+db.dropDatabase();
+coll = db[collName];
+const sess = db.getMongo().startSession();
+const txColl = sess.getDatabase(dbName).getCollection(collName);
+let splitDoc;
+
+// Shard key and chunk split point depends on whether using "trait" field to promote Shard Tx affinity
+if (promoteTxShardAffinity) {
+  sh.shardCollection(namespace, {trait: 1, parentId: 1, objectId: 1});
+  splitDoc = {trait: TRAIT_TYPES[Math.floor(TRAIT_TYPES.length / 2)], parentId: "Z", objectId: "0"};
+} else {
+  sh.shardCollection(namespace, {parentId: 1, objectId: 1});
+  splitDoc = {parentId: "D3", objectId: "0"};
+}
+
+// Initially there's just one big chunk on one shard so split and move a new chunk to the other shard with a sleep
+const firstShard = Object.getOwnPropertyNames(coll.stats().shards)[0];
+const secondShard = shardNames.find(element => element !== firstShard);
+db.adminCommand({split: namespace, middle: splitDoc});
+sh.moveChunk(namespace, splitDoc, secondShard);
+sleep(5); // Sleep for a while to to allow chunk move to finish
+const startTime = new Date();
+const beforeServerStatusTxCommitTypes = db.serverStatus().transactions.commitTypes
+const beforeSingleShardCount = beforeServerStatusTxCommitTypes.singleShard.successful.low;
+const beforeTwoPhaseCommitCount = beforeServerStatusTxCommitTypes.twoPhaseCommit.successful.low;
+
+// Loop down thru a number of levels creating child objects at each level referencing parent objects in level above
+for (let a = 0; a < MAX_LEVEL_ITERATIONS; a++) { 
+  const aObjectId = `A${a}`;  
+  coll.insertOne({trait: "base", parentId: "<root>", objectId: aObjectId, value: Math.random()});
+
+  for (let b = 0; b < MAX_LEVEL_ITERATIONS; b++) {    
+    const bObjectId = `B${b}`;  
+    coll.insertOne({trait: "base", parentId: aObjectId, objectId: bObjectId, value: Math.random()});
+
+    for (let c = 0; c < MAX_LEVEL_ITERATIONS; c++) {    
+      const trait = TRAIT_TYPES[Math.floor(c / MAX_LEVEL_ITERATIONS * TRAIT_TYPES.length)];
+      const cObjectId = `C${c}`;  
+      // Start tagging each branch from here downwards with a particular trait
+      coll.insertOne({trait: trait, parentId: bObjectId, objectId:cObjectId, value: Math.random()}).insertedId;
+      
+      for (let d = 0; d < MAX_LEVEL_ITERATIONS; d++) {    
+        const dObjectId = `D${d}`;  
+
+        // Start of transaction including parent object and a number of child objects with same trait
+        sess.startTransaction({readConcern: {level: 'snapshot'}, writeConcern: {w: 'majority'}});
+        txColl.insertMany([
+          {trait: trait, parentId: cObjectId, objectId: dObjectId, value: Math.random()},
+          {trait: trait, parentId: dObjectId, objectId: 1, value: Math.random()},
+          {trait: trait, parentId: dObjectId, objectId: 2, value: Math.random()},
+          {trait: trait, parentId: dObjectId, objectId: 3, value: Math.random()},
+          {trait: trait, parentId: dObjectId, objectId: 4, value: Math.random()},
+          {trait: trait, parentId: dObjectId, objectId: 5, value: Math.random()},
+        ]);
+        sess.commitTransaction();       
+        // End of transaction         
+      }
+    }
+  }
+}
+
+// Print summary info
+const shardCollStats = coll.stats().shards;
+const afterServerStatusTxCommitTypes = db.serverStatus().transactions.commitTypes
+const afterSingleShardCount = afterServerStatusTxCommitTypes.singleShard.successful.low;
+const afterTwoPhaseCommitCount = afterServerStatusTxCommitTypes.twoPhaseCommit.successful.low;
+console.log(promoteTxShardAffinity ? "--With Tx Shard Affinity--" : "--Without Tx Shard Affinity--");
+console.log(`First shard id: ${firstShard}, second shard id: ${secondShard}`);
+console.log(`Finished in: ${((new Date).getTime() - startTime.getTime()) / 1000} seconds`);
+console.log(`Shard0 docs count: ${shardCollStats.shard0.count}`);
+console.log(`Shard1 docs count: ${shardCollStats.shard1.count}`);
+console.log(`Single-shard transactions executed: ${afterSingleShardCount - beforeSingleShardCount}`);
+console.log(`Two-phase-commit transactions executed: ${afterTwoPhaseCommitCount - beforeTwoPhaseCommitCount}`);
+
+
+
+/*
+
+Affinity field name?
+* trait?
+* branch?
+* flavour?
+* colour?
+* clump?
+* purpose?
+
+Which required?:
+ * Affinity part way into a branch and downwards?
+ * Affinity between clumps in different branches?
+
+Desires:
+ * Want write transaction shard affinity (writing child objects for same parent)
+ * TODO: document read use case to avoid scatter-gather
+ * Assumes different threads (clients in rewal world) will be typically working on a set of objects hanging off different parents folders for read and write distributuon
+ * Want low-cardinality of first part of compound key to promote read locality for ranges
+
+*/
